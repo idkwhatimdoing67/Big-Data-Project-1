@@ -3,7 +3,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-#import fcntl
+import fcntl
 from html.parser import HTMLParser
 import json
 import logging
