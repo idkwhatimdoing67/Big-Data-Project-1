@@ -1,6 +1,6 @@
 # CS4371 Group Project 1 — Person 1
 
-This repository contains the Hacker News producer and the Kafka-to-Kibana path for named-entity totals. It includes 1,000 unique real Hacker News messages collected on November 13, 2026, in `outputs/collected_messages.jsonl`. No classifier or entity extraction application is included here.
+This guide covers the Hacker News producer and the Kafka-to-Kibana path for named-entity totals. The included `outputs/collected_messages.jsonl` has 1,010 real Hacker News records with distinct IDs and 1,008 distinct cleaned texts. Person 3's classifier deduplicates by text and uses those 1,008 texts. See [README3.md](README3.md) for model training and classification.
 
 ## 1. Start Kafka and verify both listeners
 
@@ -63,7 +63,7 @@ Run without `--limit` to continue polling until Ctrl-C:
 .venv/bin/python -u part1/producer.py
 ```
 
-On the original broker, the default output path resumes from the 1,000 saved IDs. The file is appended only after Kafka acknowledges delivery, and a file lock prevents two local producers from using the same output at once. Keep a single producer and its output paired with the same topic. The file and Kafka are separate writes: a hard crash after a Kafka acknowledgment but before the file is saved can cause that record to be sent again on restart. `--limit` is the total number of unique rows in the output, including any rows already there. A fresh broker does not automatically receive records from a preexisting JSONL file.
+On the original broker, the producer resumes from the IDs in the output file. It appends only after Kafka acknowledges delivery, and a file lock prevents two local producers from using the same output at once. Keep a single producer and its output paired with the same topic. A hard crash between the Kafka acknowledgment and the file write can cause that record to be sent again on restart. `--limit` counts distinct cleaned texts, including texts already in the file. The producer preserves distinct Hacker News IDs even when their texts are identical. A fresh broker does not automatically receive records from a preexisting JSONL file.
 
 To seed a **fresh, empty** `topic1` with the included corpus instead of recollecting, run this once, before starting the continuous producer. It requires `jq` and preserves both the keys and the shared schema:
 
@@ -87,6 +87,45 @@ docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
 
 See `part1/producer.py --help` (run with `.venv/bin/python`) and `.env.example` for connection, output, poll interval, timeout, and backfill settings.
 
+### Verify the corpus with the batch classifier
+
+The Kafka reader in `part2/batch_classify.py` uses the Spark 3.5.3 Kafka connector. The commands below use the matching PySpark version and Java 11 on macOS. To test Kafka on a fresh broker, seed the empty topic with the included corpus as shown above.
+
+```sh
+.venv/bin/python -m pip install 'pyspark==3.5.3' 'pandas==2.2.3'
+export JAVA_HOME="$(/usr/libexec/java_home -v 11)"
+export PYSPARK_PYTHON="$PWD/.venv/bin/python"
+export SPARK_LOCAL_IP=127.0.0.1
+export PYSPARK_SUBMIT_ARGS='--master local[2] --driver-memory 3g --conf spark.sql.shuffle.partitions=8 pyspark-shell'
+
+.venv/bin/python part2/train_model.py \
+  --input_data part2/train.csv --model_path .venv/ag_news_model
+.venv/bin/python part2/batch_classify.py \
+  --input_file "$COLLECTED_MESSAGES_PATH" --model_path .venv/ag_news_model \
+  --output_file .venv/batch-file/predictions.csv
+```
+
+For the Kafka run, use Maven Central to resolve the Kafka connector. Keep the Ivy settings path free of spaces.
+
+```sh
+ivy_dir=$(mktemp -d /tmp/cs4371-ivy.XXXXXX)
+cat > "$ivy_dir/ivysettings.xml" <<'XML'
+<ivysettings>
+  <settings defaultResolver="central"/>
+  <resolvers>
+    <ibiblio name="central" root="https://repo.maven.apache.org/maven2/" m2compatible="true"/>
+  </resolvers>
+</ivysettings>
+XML
+export PYSPARK_SUBMIT_ARGS="${PYSPARK_SUBMIT_ARGS%pyspark-shell} --conf spark.jars.ivySettings=$ivy_dir/ivysettings.xml --conf spark.jars.ivy=$ivy_dir pyspark-shell"
+.venv/bin/python part2/batch_classify.py \
+  --source kafka --bootstrap_servers "${KAFKA_BOOTSTRAP_SERVERS:-${KAFKA_ADVERTISED_HOST}:${KAFKA_HOST_PORT}}" \
+  --topic "$KAFKA_TOPIC1" --model_path .venv/ag_news_model \
+  --output_file .venv/batch-kafka/predictions.csv
+```
+
+Each run should report 1,008 clean unique messages when using only the included corpus. It also creates a 50-message sample with a blank `human_label` column for manual evaluation.
+
 ## 3. Start Elasticsearch, Logstash and Kibana
 
 ```sh
@@ -99,7 +138,7 @@ curl -fsS "http://127.0.0.1:$ELASTICSEARCH_HOST_PORT/_cluster/health"
 curl -fsS "http://127.0.0.1:$KIBANA_HOST_PORT/api/status" | jq '.status.overall'
 ```
 
-Wait for the init containers to exit with code 0 and for Logstash to report that its pipeline started. Compose builds Logstash with the pipeline config copied in, so Docker Desktop does not need access to the macOS Documents folder at runtime. Run `docker compose up -d --build logstash` after editing `part1/logstash.conf`.
+Wait for the init containers to exit with code 0 and for Logstash to report that its pipeline started. Compose builds Logstash with the pipeline config copied in, so Docker Desktop does not need access to the macOS Documents folder at runtime. Run `docker compose up -d --build logstash` after editing `part1/logstash.conf`. Elasticsearch uses a 512 MB heap for the local dataset. Set `ELASTICSEARCH_HEAP_SIZE` in `.env` if you give the stack more memory.
 
 Logstash reads the shared cumulative message format from `topic2`:
 
