@@ -110,8 +110,9 @@ class HackerNews:
         return message_from_item(self.get(f"item/{item_id}.json"), item_id)
 
 
-def read_ids(output):
+def read_history(output, track_texts):
     ids = set()
+    texts = set()
     for line_no, line in enumerate(output, 1):
         try:
             record = json.loads(line)
@@ -127,7 +128,9 @@ def read_ids(output):
         except (ValueError, TypeError, KeyError) as exc:
             raise ValueError(f"Invalid JSONL record on line {line_no}: {exc}") from exc
         ids.add(item_id)
-    return ids
+        if track_texts:
+            texts.add(record["text"])
+    return ids, texts
 
 
 def publish_batch(producer, topic, messages, output, seen):
@@ -166,7 +169,7 @@ def options():
     parser.add_argument("--poll-seconds", type=float, default=os.getenv("HN_POLL_SECONDS", "10"))
     parser.add_argument("--workers", type=int, default=os.getenv("HN_FETCH_WORKERS", "16"))
     parser.add_argument("--http-timeout", type=float, default=os.getenv("HN_HTTP_TIMEOUT_SECONDS", "10"))
-    parser.add_argument("--limit", type=int, help="Stop when the output contains this many unique messages in total.")
+    parser.add_argument("--limit", type=int, help="Stop when the output contains this many distinct cleaned texts.")
     args = parser.parse_args()
     for name in ("backfill_items", "poll_seconds", "workers", "http_timeout", "limit"):
         value = getattr(args, name)
@@ -175,13 +178,11 @@ def options():
     return args
 
 
-def collect(args, producer, api, output, seen, stop):
+def collect(args, producer, api, output, seen, texts, stop):
     # Start near the current high-water mark; then follow newly assigned item IDs.
     cursor = None
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         while not stop.is_set():
-            if args.limit is not None and len(seen) >= args.limit:
-                return
             try:
                 latest = api.latest()
                 if cursor is None:
@@ -194,12 +195,21 @@ def collect(args, producer, api, output, seen, stop):
                     item_ids = (i for i in range(low, high) if str(i) not in seen)
                     batch = [message for message in pool.map(api.fetch, item_ids) if message]
                     if args.limit is not None:
-                        batch = batch[:args.limit - len(seen)]
+                        # Different HN IDs may have identical text. Match the batch
+                        # classifier's deduplication when collecting toward a target.
+                        new_texts = set()
+                        for index, message in enumerate(batch):
+                            if message["text"] not in texts:
+                                new_texts.add(message["text"])
+                            if len(texts) + len(new_texts) >= args.limit:
+                                batch = batch[:index + 1]
+                                break
+                        texts.update(new_texts)
                     if batch:
                         publish_batch(producer, args.topic, batch, output, seen)
                         LOG.info("Published and saved %d messages (%d total)", len(batch), len(seen))
                     cursor = max(cursor, high)
-                    if args.limit is not None and len(seen) >= args.limit:
+                    if args.limit is not None and len(texts) >= args.limit:
                         return
             except APIError as exc:
                 LOG.warning("Hacker News poll interrupted; will retry: %s", exc)
@@ -219,9 +229,9 @@ def main():
     with args.output.open("a+", encoding="utf-8", newline="\n") as output:
         fcntl.flock(output, fcntl.LOCK_EX | fcntl.LOCK_NB)
         output.seek(0)
-        seen = read_ids(output)
+        seen, texts = read_history(output, track_texts=args.limit is not None)
         LOG.info("Loaded %d existing IDs from %s", len(seen), args.output)
-        if args.limit is not None and len(seen) >= args.limit:
+        if args.limit is not None and len(texts) >= args.limit:
             return
         producer = Producer({
             "bootstrap.servers": args.bootstrap_servers,
@@ -231,7 +241,7 @@ def main():
         metadata = producer.list_topics(timeout=10)
         if args.topic not in metadata.topics or metadata.topics[args.topic].error:
             raise RuntimeError(f"Kafka topic {args.topic!r} is unavailable; start kafka-init first")
-        collect(args, producer, HackerNews(args.api_base_url, args.http_timeout), output, seen, stop)
+        collect(args, producer, HackerNews(args.api_base_url, args.http_timeout), output, seen, texts, stop)
 
 
 if __name__ == "__main__":

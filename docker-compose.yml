@@ -48,7 +48,7 @@ services:
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
-      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+      ES_JAVA_OPTS: "-Xms${ELASTICSEARCH_HEAP_SIZE:-512m} -Xmx${ELASTICSEARCH_HEAP_SIZE:-512m}"
     ports:
       - "127.0.0.1:${ELASTICSEARCH_HOST_PORT:-9200}:9200"
     volumes:
