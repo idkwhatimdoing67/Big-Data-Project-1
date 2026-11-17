@@ -6,3 +6,6 @@ __pycache__/
 
 # Optional additional collection output
 outputs/fresh_messages.jsonl
+
+# Spark checkpoints
+checkpoints/
