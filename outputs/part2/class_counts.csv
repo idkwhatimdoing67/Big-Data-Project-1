@@ -1,0 +1,5 @@
+prediction,predicted_class,count
+0.0,World,53
+1.0,Sports,110
+2.0,Business,182
+3.0,Sci/Tech,663
